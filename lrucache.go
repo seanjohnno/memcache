@@ -3,6 +3,7 @@ package memcache
 import (
 	"errors"
 	"sync"
+	"fmt"
 )
 
 const (
@@ -22,7 +23,79 @@ func CreateLRUCache(maxsize int) (Cache) {
 }
 
 // ------------------------------------------------------------------------------------------------------------------------
-// Structs (not exported)
+// Struct: lruCacheItem (not exported)
+// ------------------------------------------------------------------------------------------------------------------------
+
+// lruCacheItem represents a single cache item
+type lruCacheItem struct {
+
+	// cacheItem is the underlying item - stored so we can find its size
+	cacheItem CacheItem
+
+	// key is the key we'd use in Get(key) to retrieve the item
+	key string
+
+	// prev is the previous item in the linked-list, nil if we're the head
+	prev *lruCacheItem
+
+	// next is the next item in the linked-list, nil if we're the tail
+	next *lruCacheItem
+}
+
+// Remove removes this item from the lruCache and handles all clearup
+//
+// It pairs sibling nodes and points head/tail elsewhere if it was either. It also removes itself from the hash and alters 
+// the cache size
+func (this *lruCacheItem) Remove(cache *lruCache) {
+	// Join up left and right nodes (or point them at nil if heads and tails)
+	if this.prev != nil {
+		this.prev.next = this.next
+	}
+	if this.next != nil {
+		this.next.prev = this.prev
+	}
+
+	// Point head / tail at new node if this was either
+	if this == cache.head {
+		cache.head = this.next
+	}
+	if this == cache.tail {
+		cache.tail = this.prev
+	}
+
+	// Remove size
+	cache.curSize -= this.cacheItem.Size()
+
+	// Remove from map
+	delete(cache.keyValMap, this.key)
+}
+
+// Add adds this item to the head of the cache and alters the cache state accordigly
+//
+// It sets itself as the head and links the previous head and itself together. It also adds itself to the hash and alters
+// the cache size
+func (this *lruCacheItem) Add(cache *lruCache) {
+	// If we're the only element then set head and tail
+	if cache.head == nil {
+		cache.head = this
+		cache.tail = this
+
+	// Otherwise, this is the new head
+	} else {
+		cache.head.prev = this
+		this.next = cache.head
+		cache.head = this
+	}
+
+	// Add size to cache
+	cache.curSize += this.cacheItem.Size()
+
+	// Add to map
+	cache.keyValMap[this.key] = this
+}
+
+// ------------------------------------------------------------------------------------------------------------------------
+// Struct: lruCache (not exported)
 // ------------------------------------------------------------------------------------------------------------------------
 
 // lruCache is a used to implement the LRU cache implementation 
@@ -50,22 +123,6 @@ type lruCache struct {
 	mutex sync.Mutex
 }
 
-// lruCacheItem represents a single cache item
-type lruCacheItem struct {
-
-	// cacheItem is the underlying item - stored so we can find its size
-	cacheItem CacheItem
-
-	// key is the key we'd use in Get(key) to retrieve the item
-	key string
-
-	// prev is the previous item in the linked-list, nil if we're the head
-	prev *lruCacheItem
-
-	// next is the next item in the linked-list, nil if we're the tail
-	next *lruCacheItem
-}
-
 // ------------------------------------------------------------------------------------------------------------------------
 // Cache Implementation
 // ------------------------------------------------------------------------------------------------------------------------
@@ -77,51 +134,35 @@ type lruCacheItem struct {
 // the current size > max size then tail items are removed until it falls under max size
 func (this *lruCache) Add(k string, v CacheItem) error {
 
-	this.Remove(k)
+	// Lock method so hash ad linked-list can be accessed safely from multiple go-routines. Unlock when func returns
+	this.mutex.Lock()
+	defer this.mutex.Unlock()
 
-	// Create item
-	lruItem := &lruCacheItem { cacheItem: v, key: k }
+	// If we already contain item then remove from linked-list (value may be different)
+	if item, present := this.keyValMap[k]; present {
+		// Removes from position in linked-list
+		item.Remove(this)
+		
+		// Values are the same so we can just move to the start of the array
+		if v == item.cacheItem {
+			item.Add(this)
+			return nil
+		}
+	}
 
 	// Can't store if it already exceeds max size
 	if v.Size() > this.maxSize {
 		return errors.New(ErrorExceedsMaxSize)
 	}
 
-	// Lock method so hash ad linked-list can be accessed safely from multiple go-routines. Unlock when func returns
-	this.mutex.Lock()
-	defer this.mutex.Unlock()
-
 	// Remove tail items until we're under max size
 	for this.curSize + v.Size() > this.maxSize {
-		// Need to remove from hash as well as 
-		delete(this.keyValMap, this.tail.key)
-		this.curSize -= this.tail.cacheItem.Size()
-
-		newTail := this.tail.prev
-		if newTail != nil {
-			newTail.next = nil
-			this.tail = newTail
-		} else {
-			this.head = nil
-			this.tail = nil
-		}
+		this.tail.Remove(this)
 	}
 
-	// Add to map (locking as maps aren't thread safe)
-	this.keyValMap[k] = lruItem
-
-	// If we're empty then head/tail are both new item
-	if this.head == nil {
-		this.head = lruItem
-		this.tail = lruItem
-
-	// New item is new head
-	} else {
-		lruItem.next = this.head
-		this.head.prev = lruItem
-		this.head = lruItem
-	}
-
+	// Create item
+	lruItem := &lruCacheItem { cacheItem: v, key: k }
+	lruItem.Add(this)
 	return nil
 }
 
@@ -129,28 +170,17 @@ func (this *lruCache) Add(k string, v CacheItem) error {
 //
 // If item is present then the item, true is returned. Otherwise, nil, false
 func (this *lruCache) Get(key string) (CacheItem, bool) {
-	
+
 	// Lock method so hash ad linked-list can be accessed safely from multiple go-routines. Unlock when func returns
 	this.mutex.Lock()
 	defer this.mutex.Unlock()
 
 	// See if the cache contains the item
-	val, containsKey := this.keyValMap[key]
-	if containsKey {
-		// If so we move to the front of the linked-list
-		if this.head != val {
-			val.prev.next = val.next
-
-			if val.next != nil {
-				val.next.prev = val.prev
-			}
-
-			val.prev = nil
-			val.next = this.head
-			this.head.prev = val
-			this.head = val
-		}
-		return val.cacheItem, containsKey
+	if item, containsKey := this.keyValMap[key]; containsKey {
+		item.Remove(this)
+		item.Add(this)
+		
+		return item.cacheItem, containsKey
 	}
 	return nil, false
 }
@@ -161,38 +191,9 @@ func (this *lruCache) Remove(key string) {
 	this.mutex.Lock()
 	defer this.mutex.Unlock()
 
-	// Check if item is present in cache
+		// Check if item is present in cache
 	lruCacheItem, present := this.keyValMap[key]
 	if present {
-		delete(this.keyValMap, key)
-
-		this.curSize -= lruCacheItem.cacheItem.Size()
-
-		// If the node is the head of the linked list
-		if lruCacheItem == this.head {
-			if this.head.next != nil {
-				lruCacheItem.next.prev = nil
-				this.head = lruCacheItem.next
-			} else {
-				this.head = nil
-				this.tail = nil
-			}
-
-		// If the node is the tail of the linked list
-		} else if lruCacheItem == this.tail {
-			
-			if this.tail.prev != nil {
-				lruCacheItem.prev.next = nil
-				this.tail = lruCacheItem.prev
-			} else {
-				this.head = nil
-				this.tail = nil
-			}
-
-		// If the nodes in the middle then join the neighbours up
-		} else {
-			lruCacheItem.prev.next = lruCacheItem.next
-			lruCacheItem.next.prev = lruCacheItem.prev
-		}
+		lruCacheItem.Remove(this)
 	}
 }
