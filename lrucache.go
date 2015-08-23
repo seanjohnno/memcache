@@ -3,7 +3,6 @@ package memcache
 import (
 	"errors"
 	"sync"
-	"fmt"
 )
 
 const (
@@ -119,7 +118,7 @@ type lruCache struct {
 	// curSize holds the current size of the cache
 	curSize int
 
-	// mutex is used to synchronize cache as it can be accessed by 
+	// mutex is used to synchronize cache as it can be accessed by multiple goroutines
 	mutex sync.Mutex
 }
 
