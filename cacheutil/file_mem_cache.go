@@ -1,4 +1,4 @@
-package memcache
+package cacheutil
 
 import (
 	"time"
